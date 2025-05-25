@@ -3,19 +3,18 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { CoreHeaders, HttpOptions_Style, Log, LogLevel } from "miniflare";
 import {
-	AIFetcher,
 	EXTERNAL_AI_WORKER_NAME,
 	EXTERNAL_AI_WORKER_SCRIPT,
+	getAIFetcher,
 } from "../ai/fetcher";
 import { ModuleTypeToRuleType } from "../deployment-bundle/module-collection";
 import { withSourceURLs } from "../deployment-bundle/source-url";
-import { createFatalError, UserError } from "../errors";
+import { UserError } from "../errors";
 import { getFlag } from "../experimental-flags";
 import {
 	EXTERNAL_IMAGES_WORKER_NAME,
 	EXTERNAL_IMAGES_WORKER_SCRIPT,
-	imagesLocalFetcher,
-	imagesRemoteFetcher,
+	getImagesRemoteFetcher,
 } from "../images/fetcher";
 import { logger } from "../logger";
 import { getSourceMappedString } from "../sourcemap";
@@ -178,6 +177,7 @@ export interface ConfigBundle {
 	format: CfScriptFormat | undefined;
 	compatibilityDate: string | undefined;
 	compatibilityFlags: string[] | undefined;
+	complianceRegion: Config["compliance_region"] | undefined;
 	bindings: CfWorkerInit["bindings"];
 	migrations: Config["migrations"] | undefined;
 	workerDefinitions: WorkerRegistry | undefined | null;
@@ -461,6 +461,7 @@ type WorkerOptionsBindings = Pick<
 	| "workflows"
 	| "wrappedBindings"
 	| "secretsStoreSecrets"
+	| "images"
 	| "email"
 	| "analyticsEngineDatasets"
 	| "tails"
@@ -477,6 +478,7 @@ type MiniflareBindingsConfig = Pick<
 	| "serviceBindings"
 	| "imagesLocalMode"
 	| "tails"
+	| "complianceRegion"
 > &
 	Partial<Pick<ConfigBundle, "format" | "bundle" | "assets">>;
 
@@ -754,7 +756,9 @@ export function buildMiniflareBindingOptions(
 					},
 				],
 				serviceBindings: {
-					FETCHER: AIFetcher,
+					FETCHER: getAIFetcher({
+						compliance_region: config.complianceRegion,
+					}),
 				},
 			});
 
@@ -764,7 +768,8 @@ export function buildMiniflareBindingOptions(
 		}
 	}
 
-	if (bindings.images?.binding) {
+	// Uses the implementation in miniflare instead if the users enable local mode
+	if (bindings.images?.binding && !config.imagesLocalMode) {
 		externalWorkers.push({
 			name: `${EXTERNAL_IMAGES_WORKER_NAME}:${config.name}`,
 			modules: [
@@ -775,9 +780,9 @@ export function buildMiniflareBindingOptions(
 				},
 			],
 			serviceBindings: {
-				FETCHER: config.imagesLocalMode
-					? imagesLocalFetcher
-					: imagesRemoteFetcher,
+				FETCHER: getImagesRemoteFetcher({
+					compliance_region: config.complianceRegion,
+				}),
 			},
 		});
 
@@ -802,7 +807,10 @@ export function buildMiniflareBindingOptions(
 					},
 				],
 				serviceBindings: {
-					FETCHER: MakeVectorizeFetcher(indexName),
+					FETCHER: MakeVectorizeFetcher(
+						{ compliance_region: config.complianceRegion },
+						indexName
+					),
 				},
 				bindings: {
 					INDEX_ID: indexName,
@@ -883,6 +891,15 @@ export function buildMiniflareBindingOptions(
 		email: {
 			send_email: bindings.send_email,
 		},
+		images:
+			bindings.images && config.imagesLocalMode
+				? {
+						binding: bindings.images.binding,
+						mixedModeConnectionString: getFlag("MIXED_MODE")
+							? mixedModeConnectionString
+							: undefined,
+					}
+				: undefined,
 
 		durableObjects: Object.fromEntries([
 			...internalObjects.map(({ name, class_name }) => {
@@ -941,25 +958,12 @@ export function buildMiniflareBindingOptions(
 	};
 }
 
-type PickTemplate<T, K extends string> = {
-	[P in keyof T & K]: T[P];
-};
-type PersistOptions = PickTemplate<MiniflareOptions, `${string}Persist`>;
-export function buildPersistOptions(
+export function getDefaultPersistRoot(
 	localPersistencePath: ConfigBundle["localPersistencePath"]
-): PersistOptions | undefined {
+): string | undefined {
 	if (localPersistencePath !== null) {
 		const v3Path = path.join(localPersistencePath, "v3");
-		return {
-			cachePersist: path.join(v3Path, "cache"),
-			durableObjectsPersist: path.join(v3Path, "do"),
-			kvPersist: path.join(v3Path, "kv"),
-			r2Persist: path.join(v3Path, "r2"),
-			d1Persist: path.join(v3Path, "d1"),
-			workflowsPersist: path.join(v3Path, "workflows"),
-			secretsStorePersist: path.join(v3Path, "secrets-store"),
-			analyticsEngineDatasetsPersist: path.join(v3Path, "analytics-engine"),
-		};
+		return v3Path;
 	}
 }
 
@@ -1124,7 +1128,6 @@ export function handleRuntimeStdio(stdout: Readable, stderr: Readable) {
 let didWarnMiniflareCronSupport = false;
 let didWarnMiniflareVectorizeSupport = false;
 let didWarnAiAccountUsage = false;
-let didWarnImagesLocalModeUsage = false;
 
 export type Options = Extract<MiniflareOptions, { workers: WorkerOptions[] }>;
 
@@ -1172,23 +1175,6 @@ export async function buildMiniflareOptions(
 		}
 	}
 
-	if (config.bindings.images && config.imagesLocalMode) {
-		if (!didWarnImagesLocalModeUsage) {
-			try {
-				await import("sharp");
-			} catch {
-				const msg =
-					"Sharp must be installed to use the Images binding local mode; check your version of Node is compatible";
-				throw createFatalError(msg, false);
-			}
-
-			didWarnImagesLocalModeUsage = true;
-			logger.info(
-				"You are using Images local mode. This only supports resizing, rotating and transcoding."
-			);
-		}
-	}
-
 	const upstream =
 		typeof config.localUpstream === "string"
 			? `${config.upstreamProtocol}://${config.localUpstream}`
@@ -1198,7 +1184,7 @@ export async function buildMiniflareOptions(
 	const { bindingOptions, internalObjects, externalWorkers } =
 		buildMiniflareBindingOptions(config, mixedModeConnectionString);
 	const sitesOptions = buildSitesOptions(config);
-	const persistOptions = buildPersistOptions(config.localPersistencePath);
+	const defaultPersistRoot = getDefaultPersistRoot(config.localPersistencePath);
 	const assetOptions = buildAssetOptions(config);
 
 	const options: MiniflareOptions = {
@@ -1220,8 +1206,7 @@ export async function buildMiniflareOptions(
 		log,
 		verbose: logger.loggerLevel === "debug",
 		handleRuntimeStdio,
-
-		...persistOptions,
+		defaultPersistRoot,
 		workers: [
 			{
 				name: getName(config),
